@@ -21,6 +21,7 @@ systemctl --user daemon-reload 2>/dev/null || true
 
 say "==> removing the updater script"
 rm -f "$bin_dir/madwine-compat-update"
+rm -f "$bin_dir/madwine-fix-input"
 
 say ""
 say "Done. Installed GE-Proton copies are left in place so your game keeps working."

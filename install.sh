@@ -12,6 +12,9 @@ say "==> installing ${bin_dir}/madwine-compat-update"
 mkdir -p "$bin_dir"
 install -m 0755 "$here/bin/madwine-compat-update" "$bin_dir/madwine-compat-update"
 
+say "==> installing ${bin_dir}/madwine-fix-input"
+install -m 0755 "$here/bin/madwine-fix-input" "$bin_dir/madwine-fix-input"
+
 say "==> installing systemd user units into ${unit_dir}"
 mkdir -p "$unit_dir"
 install -m 0644 "$here/systemd/madwine-compat-update.service" "$unit_dir/"
@@ -31,6 +34,7 @@ say "  Log:        \${XDG_STATE_HOME:-\$HOME/.local/state}/madwine/compat-update
 say "  Status:     systemctl --user list-timers madwine-compat-update.timer"
 say "  Update now: systemctl --user start madwine-compat-update.service"
 say "  Check only: $bin_dir/madwine-compat-update --check"
+say "  Keyboard:   $bin_dir/madwine-fix-input --check  (see README: UseTakeFocus)"
 say ""
 say "Note: close Madwine/Roblox before the first update takes effect; the tool"
 say "      defers automatically while a game is running."

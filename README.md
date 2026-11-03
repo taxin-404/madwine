@@ -65,6 +65,37 @@ Logs: `~/.local/state/madwine/compat-update.log`
 Timer status: `systemctl --user list-timers madwine-compat-update.timer`
 Run now: `systemctl --user start madwine-compat-update.service`
 
+## Keyboard / focus fix (recommended)
+
+Madwine's Wine windows declare `WM_HINTS input = False` and rely on the `WM_TAKE_FOCUS`
+handshake. Under some compositors (e.g. **Hyprland**) the `Madium.exe` launcher does not
+honour that handshake, so keyboard focus stays on the game window and typing in the launcher
+appears dead (switching workspaces makes it work again, temporarily).
+
+`madwine-fix-input` sets Wine's `HKCU\Software\Wine\X11 Driver\UseTakeFocus = N` in Madwine's
+prefix. Wine then declares `accepts input = True` and stops advertising `WM_TAKE_FOCUS`, so the
+compositor gives the window focus directly. (Upstream reference: KDE bug 525590.)
+
+```bash
+# Madwine must be fully closed: wineserver rewrites user.reg on exit.
+madwine-fix-input --check     # is it set?
+madwine-fix-input --apply     # set it
+```
+
+Verify with Madwine running:
+
+```bash
+xprop -id "$(xdotool search --class madwine-madium | head -1)" WM_HINTS | grep -i 'accepts input'
+# expect: Client accepts input or input focus: True
+```
+
+A timestamped `user.reg.bak.*` is written before any change. To undo, remove the
+`"UseTakeFocus"="N"` line from `~/.local/share/madwine/prefix/pfx/user.reg` (with Madwine
+closed), or restore the backup.
+
+> Hyprland window rules such as `allows_input = true` were tested and do **not** fix this;
+> the compositor still sends `WM_TAKE_FOCUS`. The Wine-side setting is the reliable fix.
+
 ## Requirements
 
 `bash`, `curl`, `jq`, `tar`, `sha512sum`, `flock`, `systemd --user`, and a network

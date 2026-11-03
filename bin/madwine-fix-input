@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# madwine-fix-input — make Madwine's Wine windows accept keyboard focus.
+#
+# Why this exists
+# ---------------
+# Wine creates its top-level windows with WM_HINTS "input = False" and uses the
+# ICCCM WM_TAKE_FOCUS handshake instead of taking X input focus directly. Some
+# compositors (notably Hyprland) send WM_TAKE_FOCUS, but Madwine's launcher
+# (Madium.exe) does not honour it, so X keyboard focus stays on another window
+# and typing in the launcher appears dead. Setting Wine's UseTakeFocus=N makes
+# Wine declare "accepts input = True" and stop advertising WM_TAKE_FOCUS, so the
+# compositor calls XSetInputFocus directly.
+#
+#   Upstream reference: https://bugs.kde.org/show_bug.cgi?id=525590
+#   (xprop then shows: "Client accepts input or input focus: True")
+#
+# This script edits Madwine's Wine registry (HKCU\Software\Wine\X11 Driver).
+# Madwine must be fully closed: wineserver rewrites user.reg on exit.
+#
+# Usage:
+#   madwine-fix-input --check    # report whether the setting is present (default)
+#   madwine-fix-input --apply    # set it (Madwine must be closed)
+#
+# License: Unlicense (public domain). Independent community tool; not affiliated
+# with Madwine (https://github.com/Ring0lw/madwine) or Wine.
+
+set -euo pipefail
+
+APP_NAME="madwine-fix-input"
+PREFIX_DIR="${MADWINE_PREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/madwine/prefix/pfx}"
+REG_FILE="${MADWINE_REG_FILE:-$PREFIX_DIR/user.reg}"
+MADWINE_PROC_PATTERN="${MADWINE_PROC_PATTERN:-Madwine\.AppImage|/madwine/umu/|wineserver|RobloxPlayerBeta\.exe|Madium\.exe|msedgewebview2}"
+
+ACTION="check"
+PREFIX_OVERRIDE=""
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  ok: %s\n' "$*"; }
+warn() { printf '  !! %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+madwine-fix-input — set Wine's UseTakeFocus=N in Madwine's prefix
+
+Usage:
+  madwine-fix-input --check [--prefix DIR]   Check (default)
+  madwine-fix-input --apply [--prefix DIR]   Apply (Madwine must be closed)
+  madwine-fix-input --help
+
+Options:
+  --prefix DIR   Wine prefix directory (default: ~/.local/share/madwine/prefix/pfx)
+  --reg FILE     Registry file to edit (default: <prefix>/user.reg)
+
+Why: Wine's WM_TAKE_FOCUS handshake is not honoured by Madwine's launcher under
+some compositors, which leaves the keyboard focused on the wrong window. Setting
+"UseTakeFocus"="N" makes Wine accept input directly instead.
+EOF
+}
+
+is_madwine_running() {
+  local hits
+  hits="$(pgrep -af "$MADWINE_PROC_PATTERN" 2>/dev/null \
+            | grep -vF -- "$APP_NAME" \
+            | grep -vF -- 'pgrep' || true)"
+  [ -n "$hits" ]
+}
+
+has_value() {
+  grep -qxF '"UseTakeFocus"="N"' "$REG_FILE" 2>/dev/null
+}
+
+require_registry() {
+  [ -f "$REG_FILE" ] || die "registry not found: $REG_FILE
+Launch Madwine once so it creates the prefix, then close it and retry."
+}
+
+do_check() {
+  require_registry
+  say "registry: $REG_FILE"
+  if has_value; then
+    ok '"UseTakeFocus"="N" is present (Wine will accept input directly)'
+  else
+    warn '"UseTakeFocus"="N" is NOT present (Wine uses the WM_TAKE_FOCUS handshake)'
+    say "Run: $APP_NAME --apply   (with Madwine fully closed)"
+  fi
+  if is_madwine_running; then
+    warn "Madwine/Roblox/Wine is running; a --apply would be refused until it is closed."
+  fi
+}
+
+do_apply() {
+  require_registry
+  if is_madwine_running; then
+    die "Madwine/Roblox/Wine is running. Close it completely first
+     (including the launcher, *.exe, msedgewebview2 and wineserver),
+     because wineserver rewrites user.reg on exit."
+  fi
+  if has_value; then
+    ok 'already applied; no change'
+    return 0
+  fi
+
+  local stamp backup tmp n
+  stamp="$(date +%Y%m%d%H%M%S)"
+  backup="$REG_FILE.bak.$stamp"
+  cp -p "$REG_FILE" "$backup"
+  say "backup: $backup"
+
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp:-}"' EXIT
+
+  if grep -q 'X11 Driver\]' "$REG_FILE"; then
+    awk -v val='"UseTakeFocus"="N"' '
+      BEGIN { insec = 0; done = 0 }
+      /^\[.*X11 Driver\]/ { print; insec = 1; next }
+      insec && /^\[/ {
+        if (!done) { print val; done = 1 }
+        print; insec = 0; next
+      }
+      insec && /^"UseTakeFocus"=/ {
+        if (!done) { print val; done = 1 }
+        next
+      }
+      { print }
+      END { if (insec && !done) print val }
+    ' "$REG_FILE" > "$tmp"
+  else
+    cp "$REG_FILE" "$tmp"
+    cat >> "$tmp" <<'EOF'
+
+[Software\\Wine\\X11 Driver] 0
+"UseTakeFocus"="N"
+EOF
+  fi
+
+  [ -s "$tmp" ] || die "internal error: generated registry is empty"
+  n="$(grep -cxF '"UseTakeFocus"="N"' "$tmp" || true)"
+  [ "$n" -eq 1 ] || die "internal error: expected exactly one UseTakeFocus entry, got $n"
+
+  # Overwrite in place to preserve ownership/permissions.
+  cat "$tmp" > "$REG_FILE"
+  ok 'applied "UseTakeFocus"="N"'
+  say ""
+  say "Next: launch Madwine and verify with:"
+  say "  xprop -id \"\$(xdotool search --class madwine-madium | head -1)\" WM_HINTS | grep -i 'accepts input'"
+  say "  # expect: Client accepts input or input focus: True"
+}
+
+# --- argument parsing -------------------------------------------------------
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)  ACTION="check" ;;
+    --apply)  ACTION="apply" ;;
+    --prefix) shift; [ "$#" -gt 0 ] || die "--prefix needs a value"; PREFIX_OVERRIDE="$1" ;;
+    --reg)    shift; [ "$#" -gt 0 ] || die "--reg needs a value"; REG_FILE="$1" ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+if [ -n "$PREFIX_OVERRIDE" ]; then
+  PREFIX_DIR="$PREFIX_OVERRIDE"
+  REG_FILE="$PREFIX_DIR/user.reg"
+fi
+
+case "$ACTION" in
+  check) do_check ;;
+  apply) do_apply ;;
+esac

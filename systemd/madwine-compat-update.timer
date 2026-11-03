@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Madwine GE-Proton compatibility-layer update
+
+[Timer]
+# Shortly after login, then once a day. Persistent catches up missed runs.
+OnStartupSec=2min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+Unit=madwine-compat-update.service
+
+[Install]
+WantedBy=timers.target

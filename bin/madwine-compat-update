@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# madwine-compat-update — keep Madwine's Proton compatibility layer on the newest GE-Proton.
+#
+# Why this exists
+# ---------------
+# Madwine (https://github.com/Ring0lw/madwine) bundles one pinned GE-Proton build
+# and only ever updates the launcher *app*, never the compatibility layer. This
+# tool fills that gap: it downloads the latest GE-Proton release from
+# GloriousEggroll/proton-ge-custom, verifies its SHA-512, installs it into
+# Madwine's own proton directory, and points Madwine at it by rewriting the
+# `proton` field in Madwine's config.json.
+#
+#   Madwine selects the compatibility layer from config.json's "proton" field
+#   (it becomes umu's PROTONPATH).  The "reuseSteamProton" flag is not honoured
+#   for layer selection, so this tool sets "proton" directly and clears that flag.
+#
+# Safety
+# ------
+#   * Refuses to change anything while Madwine/Roblox/Wine is running.
+#   * Verifies the download against the release's .sha512sum before installing.
+#   * Backs up config.json before editing it.
+#   * Removes older GE-Proton copies it manages, keeping the previous one as a
+#     rollback fallback.  Non-GE-Proton layers are never touched.
+#   * Fully reversible: uninstall.sh / see README.
+#
+# License: Unlicense (public domain). This is an independent community tool and is
+# not affiliated with Madwine or GloriousEggroll.
+
+set -euo pipefail
+
+APP_NAME="madwine-compat-update"
+PROTON_REPO="GloriousEggroll/proton-ge-custom"
+PROTON_API="${MADWINE_COMPAT_PROTON_API:-https://api.github.com/repos/${PROTON_REPO}/releases/latest}"
+PROTON_DL="${MADWINE_COMPAT_PROTON_DL:-https://github.com/${PROTON_REPO}/releases/download}"
+
+# --- overridable configuration ---------------------------------------------
+MADWINE_CONFIG="${MADWINE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/madwine/config.json}"
+PROTON_DIR="${MADWINE_COMPAT_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/madwine/proton}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/madwine"
+LOG_FILE="${MADWINE_COMPAT_LOG:-$STATE_DIR/compat-update.log}"
+LOCK_FILE="$STATE_DIR/compat-update.lock"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/madwine-compat-update"
+
+# Processes that mean "a game is live; do not swap files under it".
+MADWINE_PROC_PATTERN="${MADWINE_PROC_PATTERN:-Madwine\.AppImage|/madwine/umu/|wineserver|RobloxPlayerBeta\.exe}"
+
+# 1 = delete older GE-Proton* dirs from PROTON_DIR, keeping the newly installed
+# one and one previous copy (rollback). Non-GE-Proton layers are never touched.
+PURGE_OLDER="${MADWINE_COMPAT_PURGE_OLDER:-1}"
+
+# Optional pin, e.g. MADWINE_COMPAT_PIN=GE-Proton11-12 (or --version).
+PIN_VERSION="${MADWINE_COMPAT_PIN:-}"
+
+DRY_RUN=0
+FORCE=0
+CHECK_ONLY=0
+
+# --- helpers ----------------------------------------------------------------
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log() {
+  local line
+  line="$(printf '%s  %s' "$(ts)" "$*")"
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+warn() { log "WARN: $*" >&2; }
+die()  { log "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+$APP_NAME — keep Madwine's GE-Proton compatibility layer on the latest release
+
+Usage: $APP_NAME [options]
+
+Options:
+  --check            Report installed vs latest and exit (no changes).
+  --dry-run          Show what would happen; nothing is downloaded or installed.
+  --force            Reinstall even if the latest version is already present.
+  --version <tag>    Use a specific GE-Proton tag (e.g. GE-Proton11-12) instead of the newest.
+  -h, --help         Show this help.
+
+Environment overrides:
+  MADWINE_CONFIG       Path to Madwine config.json (default: ~/.config/madwine/config.json)
+  MADWINE_COMPAT_DIR   Where to install the layer (default: ~/.local/share/madwine/proton)
+  MADWINE_COMPAT_PIN   Pin a GE-Proton tag.
+  MADWINE_COMPAT_PURGE_OLDER  1 (default) or 0.
+  MADWINE_PROC_PATTERN Process regex that blocks the update while running.
+EOF
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+kver() { # kernel -> arch tag used in GE-Proton asset names
+  case "$(uname -m)" in
+    x86_64|amd64) echo x86_64 ;;
+    aarch64|arm64) echo aarch64 ;;
+    *) echo "unsupported-arch" ;;
+  esac
+}
+
+# Return 0 if a build process is live.
+is_madwine_running() {
+  local hits
+  hits="$(pgrep -af "$MADWINE_PROC_PATTERN" 2>/dev/null \
+            | grep -vF -- "$APP_NAME" \
+            | grep -vF -- 'pgrep' || true)"
+  [ -n "$hits" ]
+}
+
+get_latest_tag() {
+  local tag
+  if have jq; then
+    tag="$(curl -fsSL "$PROTON_API" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  fi
+  if [ -z "${tag:-}" ]; then
+    tag="$(curl -fsSL "$PROTON_API" 2>/dev/null \
+            | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | head -1 | sed 's/.*"\([^"]*\)"$/\1/' || true)"
+  fi
+  [ -n "${tag:-}" ] || die "could not determine the latest GE-Proton release (network/API problem)"
+  printf '%s\n' "$tag"
+}
+
+# download <url> <dest>  (resume on first try, restart fresh on retries)
+download() {
+  local url="$1" dest="$2" attempt
+  for attempt in 1 2 3 4; do
+    if [ "$attempt" -eq 1 ]; then
+      # resume a partial file if one exists
+      curl -fL --retry 3 --retry-delay 2 -C - -o "$dest" "$url" && return 0
+    else
+      # a stale/partial/corrupt file can break resume; start clean
+      rm -f -- "$dest"
+      curl -fL --retry 3 --retry-delay 2 -o "$dest" "$url" && return 0
+    fi
+    log "download attempt $attempt/4 failed for $url"
+    sleep 2
+  done
+  return 1
+}
+
+sha512_of() { sha512sum "$1" | awk '{print $1}'; }
+
+# --- core steps -------------------------------------------------------------
+# The layer Madwine is currently configured to use (basename), per config.json.
+configured_proton() {
+  [ -f "$MADWINE_CONFIG" ] || return 0
+  local p
+  p="$(jq -r '.proton // empty' "$MADWINE_CONFIG" 2>/dev/null || true)"
+  [ -n "$p" ] && basename "$p"
+}
+
+# Newest GE-Proton* dir present in PROTON_DIR (basename), if any.
+installed_dir_name() {
+  [ -d "$PROTON_DIR" ] || return 0
+  find "$PROTON_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*-*' -printf '%f\n' 2>/dev/null | sort -V | tail -1
+}
+
+# prune_older <keep>...  — drop GE-Proton* dirs not named among the keep args.
+prune_older() {
+  [ "$PURGE_OLDER" = "1" ] || return 0
+  [ -d "$PROTON_DIR" ] || return 0
+  local base keep d
+  while IFS= read -r d; do
+    base="$(basename "$d")"
+    keep=0
+    for k in "$@"; do [ -n "$k" ] && [ "$base" = "$k" ] && keep=1; done
+    [ "$keep" = "1" ] && continue
+    case "$base" in
+      GE-Proton*-*)
+        if [ "$DRY_RUN" -eq 1 ]; then
+          log "DRY-RUN: would remove old copy $PROTON_DIR/$base"
+        else
+          log "removing old copy $PROTON_DIR/$base"
+          rm -rf -- "$d"
+        fi
+        ;;
+    esac
+  done < <(find "$PROTON_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*-*' 2>/dev/null)
+}
+
+# Point Madwine at <dest> and make sure the inert reuse flag can't shadow it.
+set_config_proton() {
+  local dest="$1"
+  local cfg="$MADWINE_CONFIG"
+  if [ ! -f "$cfg" ]; then
+    warn "Madwine config not found at $cfg — start Madwine once, then re-run. Skipping config."
+    return 0
+  fi
+  if [ "$(jq -r '.proton // empty' "$cfg" 2>/dev/null)" = "$dest" ]; then
+    log "config OK: proton=$dest"
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    log "DRY-RUN: would set proton=$dest in $cfg"
+  else
+    local bak tmp
+    bak="$cfg.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$cfg" "$bak"
+    tmp="$(mktemp "${cfg}.XXXXXX")"
+    if jq --arg p "$dest" '.proton = $p | .reuseSteamProton = false' "$cfg" >"$tmp"; then
+      mv "$tmp" "$cfg"
+      log "set proton=$dest (reuseSteamProton=false) in $cfg (backup: $bak)"
+    else
+      rm -f "$tmp"
+      die "failed to update $cfg (backup kept at $bak)"
+    fi
+  fi
+}
+
+install_version() {
+  local tag="$1" arch="$2"
+  local dirname="${tag}-${arch}"
+  local dest="$PROTON_DIR/$dirname"
+  local asset="${dirname}.tar.gz"
+  local url="${PROTON_DL}/${tag}/${asset}"
+  local sumurl="${PROTON_DL}/${tag}/${dirname}.sha512sum"
+
+  if [ -d "$dest" ] && [ -f "$dest/version" ] && [ "$FORCE" -eq 0 ]; then
+    log "already installed: $dest"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "DRY-RUN: would download $url and install into $dest"
+    return 0
+  fi
+
+  mkdir -p "$CACHE_DIR"
+  local tarball="$CACHE_DIR/$asset"
+  local sumfile="$CACHE_DIR/${dirname}.sha512sum"
+
+  log "fetching checksum ${dirname}.sha512sum"
+  download "$sumurl" "$sumfile" || die "checksum download failed: $sumurl"
+  local want
+  want="$(awk '{print $1}' "$sumfile" | head -1)"
+  [ -n "$want" ] || die "empty checksum file for $asset"
+
+  if [ "$FORCE" -eq 1 ]; then rm -f -- "$tarball"; fi
+
+  if [ -f "$tarball" ] && [ "$(sha512_of "$tarball")" = "$want" ]; then
+    log "using cached download (checksum already matches)"
+  else
+    rm -f -- "$tarball"
+    log "downloading $asset"
+    download "$url" "$tarball" || die "download failed: $url"
+  fi
+
+  local got
+  got="$(sha512_of "$tarball")"
+  if [ "$want" != "$got" ]; then
+    rm -f "$tarball"
+    die "SHA-512 mismatch for $asset (want=$want got=$got)"
+  fi
+  log "checksum verified: ${got:0:16}..."
+
+  local tmpd
+  tmpd="$(mktemp -d "$CACHE_DIR/extract.XXXXXX")"
+  log "extracting $asset"
+  tar -xzf "$tarball" -C "$tmpd"
+  local src="$tmpd/$dirname"
+  [ -d "$src" ] || die "unexpected archive layout: $dirname not found after extract"
+
+  mkdir -p "$PROTON_DIR"
+  rm -rf -- "$dest"
+  mv -- "$src" "$dest"
+  rm -rf -- "$tmpd"
+
+  log "installed $dirname -> $dest"
+}
+
+# --- main -------------------------------------------------------------------
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check)    CHECK_ONLY=1 ;;
+      --dry-run)  DRY_RUN=1 ;;
+      --force)    FORCE=1 ;;
+      --version)  shift; PIN_VERSION="${1:-}"; [ -n "$PIN_VERSION" ] || die "--version needs a value" ;;
+      -h|--help)  usage; exit 0 ;;
+      *) die "unknown argument: $1 (try --help)" ;;
+    esac
+    shift
+  done
+
+  mkdir -p "$STATE_DIR"
+  [ "$DRY_RUN" -eq 1 ] || : >>"$LOG_FILE"
+
+  local t
+  for t in curl jq tar sha512sum flock; do
+    have "$t" || die "required tool missing: $t"
+  done
+
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || { log "another $APP_NAME run holds the lock; exiting"; exit 0; }
+
+  local arch tag dirname dest current configured
+  arch="$(kver)"
+  [ "$arch" != "unsupported-arch" ] || die "unsupported CPU architecture: $(uname -m)"
+
+  tag="${PIN_VERSION:-$(get_latest_tag)}"
+  dirname="${tag}-${arch}"
+  dest="$PROTON_DIR/$dirname"
+  current="$(installed_dir_name || true)"
+  configured="$(configured_proton || true)"
+
+  log "latest=$tag arch=$arch"
+  [ -n "${current:-}" ] && log "installed=$current" || log "installed=(none)"
+  [ -n "${configured:-}" ] && log "configured=$configured" || log "configured=(none)"
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    if [ "$configured" = "$dirname" ]; then
+      log "status: UP TO DATE"
+    else
+      log "status: UPDATE AVAILABLE (configured=${configured:-none} wanted=$dirname)"
+    fi
+    exit 0
+  fi
+
+  if is_madwine_running; then
+    log "Madwine/Roblox/Wine is running — deferring this run (no changes made)"
+    exit 0
+  fi
+
+  install_version "$tag" "$arch"
+  set_config_proton "$dest"
+  # Keep the new layer and the previously configured one (rollback), prune the rest.
+  prune_older "$dirname" "$configured"
+  log "done"
+}
+
+main "$@"

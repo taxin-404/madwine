@@ -1,0 +1,10 @@
+[Unit]
+Description=Update Madwine's GE-Proton compatibility layer to the latest release
+Documentation=https://github.com/taxin-404/madwine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The updater no-ops on its own if Madwine/Roblox is running, so it is always safe to fire.
+ExecStart=%h/.local/bin/madwine-compat-update
